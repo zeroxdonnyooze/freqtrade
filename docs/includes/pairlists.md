@@ -9,6 +9,22 @@ Additionally, [`AgeFilter`](#agefilter), [`PrecisionFilter`](#precisionfilter), 
 If multiple Pairlist Handlers are used, they are chained and a combination of all Pairlist Handlers forms the resulting pairlist the bot uses for trading and backtesting. Pairlist Handlers are executed in the sequence they are configured. You can define either `StaticPairList`, `VolumePairList`, `ProducerPairList`, `RemotePairList`, `MarketCapPairList` or `PercentChangePairList` as the starting Pairlist Handler.
 
 Inactive markets are always removed from the resulting pairlist. Explicitly blacklisted pairs (those in the `pair_blacklist` configuration setting) are also always removed from the resulting pairlist.
+### Developing Custom Pairlist Handlers for Dynamic Backtesting
+
+When [Enhanced Dynamic Pairlist Backtesting](backtesting.md#enhanced-dynamic-pairlist-backtesting-approach-b---pre-calculation) is active (configured via `pairlist_precalc_interval`), custom pairlist handlers need to be aware of how their `refresh_pairlist` method is utilized.
+
+During the pre-calculation phase, `refresh_pairlist(self, min_date: datetime, max_date: datetime) -> List[str]` will be called repeatedly at different historical points in time.
+- `min_date`: Represents the start of the available historical data for that particular refresh cycle.
+- `max_date`: Represents the "current" point in historical time for which the pairlist should be generated. Your handler should use data up to this `max_date` to determine the pairlist.
+
+Your `refresh_pairlist` implementation should:
+- Utilize the `max_date` to filter or rank pairs based on data available *up to that historical point*.
+- Avoid using any "current" real-time market data, as this would negate the benefits of historical pre-calculation.
+- Ensure that any data fetching or analysis within the handler respects this `max_date` to prevent lookahead bias.
+
+For example, if you are fetching top volume pairs, your query to the `DataProvider` or exchange should be constrained by `max_date`.
+
+This allows your dynamic pairlist logic to be accurately simulated as it would have performed historically.
 
 ### Pair blacklist
 

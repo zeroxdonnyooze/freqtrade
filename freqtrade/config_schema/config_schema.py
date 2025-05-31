@@ -769,6 +769,11 @@ CONF_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
         },
+        "pairlist_precalc_interval": {
+            "description": "Interval for pairlist pre-calculation during backtesting (e.g., '1d', '4h', '100c'). Defines how often the pairlist is re-evaluated.",
+            "type": "string",
+            "default": "1d",
+        },
         "orderflow": {
             "description": "Settings related to order flow.",
             "type": "object",

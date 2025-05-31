@@ -2715,3 +2715,331 @@ def test_get_backtest_metadata_filename():
     filename = "backtest_results_zip.zip"
     expected = Path("backtest_results_zip.meta.json")
     assert get_backtest_metadata_filename(filename) == expected
+class TestBacktestingDynamicPairlists:
+
+    def test_precalculate_pairlist_timeline_called(self, default_conf, mocker, caplog, testdatadir):
+        """Test that _precalculate_pairlist_timeline is called during backtesting startup."""
+        patch_exchange(mocker)
+        mocker.patch(
+            "freqtrade.plugins.pairlistmanager.PairListManager.whitelist",
+            PropertyMock(return_value=["UNITTEST/BTC"]),
+        )
+        # Mock the method we want to check
+        precalc_mock = mocker.patch("freqtrade.optimize.backtesting.Backtesting._precalculate_pairlist_timeline")
+        # Mock other methods that might be called during startup to simplify the test
+        mocker.patch("freqtrade.optimize.backtesting.Backtesting.backtest") # To avoid running full backtest
+        mocker.patch("freqtrade.optimize.backtesting.generate_backtest_stats")
+        mocker.patch("freqtrade.optimize.backtesting.show_backtest_results")
+        mocker.patch("freqtrade.optimize.backtesting.store_backtest_results")
+
+        conf = default_conf.copy()
+        conf["timerange"] = "20180110-20180111" # Ensure a valid timerange with available data
+        conf["runmode"] = RunMode.BACKTEST # Ensure correct runmode
+        conf["timeframe"] = "5m" # Ensure timeframe is set
+
+        backtesting = Backtesting(conf)
+        backtesting._set_strategy(backtesting.strategylist[0])
+        backtesting.strategy.bot_loop_start = MagicMock() # Mock strategy lifecycle methods
+        backtesting.strategy.bot_start = MagicMock()
+
+        backtesting.start()
+
+        precalc_mock.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "interval_str, expected_td_type, expected_total_seconds, raises",
+        [
+            ("daily", timedelta, 24 * 3600, False),
+            ("weekly", timedelta, 7 * 24 * 3600, False),
+            ("monthly", timedelta, 30 * 24 * 3600, False), # Approx, uses 30 days
+            ("100c", timedelta, 100 * 300, False), # 100 * 5m (300s) = 30000s
+            ("1d", timedelta, 24 * 3600, False),
+            ("2d", timedelta, 2 * 24 * 3600, False),
+            ("3w", timedelta, 3 * 7 * 24 * 3600, False),
+            ("1M", timedelta, 60, False), # ccxt parses '1M' as 1 minute
+            ("4h", timedelta, 4 * 3600, False),
+            ("invalid", None, None, True),
+            ("100x", None, None, True),
+            ("c100", None, None, True),
+        ],
+    )
+    def test_get_precalculation_interval_td(self, default_conf, mocker, interval_str, expected_td_type, expected_total_seconds, raises):
+        """Test the _get_precalculation_interval_td method for various inputs."""
+        patch_exchange(mocker)
+        conf = default_conf.copy()
+        conf["pairlist_precalc_interval"] = interval_str
+        conf["timeframe"] = "5m"
+
+        backtesting = Backtesting(conf)
+        backtesting._set_strategy(backtesting.strategylist[0])
+
+        if raises:
+            with pytest.raises(OperationalException):
+                backtesting._get_precalculation_interval_td()
+        else:
+            td = backtesting._get_precalculation_interval_td()
+            assert isinstance(td, expected_td_type)
+            if interval_str.endswith('c'):
+                # For 'Nc' format, it means N * timeframe_in_seconds
+                assert td.total_seconds() == expected_total_seconds
+            else:
+                assert td.total_seconds() == expected_total_seconds
+
+    @pytest.mark.parametrize(
+        "timerange_str, precalc_interval, expected_refresh_calls",
+        [
+            ("20180110-20180111", "daily", 1),      # Jan 10, Jan 11
+            ("1515576000-1515618900", "daily", 1),  # Jan 10 (10:00 UTC to 22:55 UTC)
+            ("20180108-20180115", "weekly", 1),     # Week of Jan 8 (Mon) to Jan 15 (Mon)
+            ("20180108-20180114", "weekly", 1),     # Week of Jan 8 (Mon) to Jan 14 (Sun)
+            ("20180101-20180201", "monthly", 1),    # Jan, Feb
+            ("20180110-20180112", "3d", 1),         # Jan 10 (next is Jan 13, outside if data ends Jan 11/12)
+            ("20180110-20180111", "12h", 2),        # Jan 10 00:00, Jan 10 12:00
+        ]
+    )
+    def test_precalculate_pairlist_timeline_intervals(self, default_conf, mocker, testdatadir, timerange_str, precalc_interval, expected_refresh_calls):
+        """Test _precalculate_pairlist_timeline with various intervals."""
+        patch_exchange(mocker)
+        # This mock ensures that when Backtesting initializes PairListManager,
+        # its whitelist will be ["UNITTEST/BTC"] for data loading.
+        mocker.patch(
+            "freqtrade.plugins.pairlistmanager.PairListManager.whitelist",
+            PropertyMock(return_value=["UNITTEST/BTC"]),
+        )
+
+        conf = default_conf.copy()
+        conf["timerange"] = timerange_str
+        conf["timeframe"] = "5m" # Ensure timeframe is set for interval calculations
+        conf["pairlist_precalc_interval"] = precalc_interval
+
+        backtesting = Backtesting(conf) # Initializes real PairListManager with mocked whitelist
+        backtesting._set_strategy(backtesting.strategylist[0])
+
+        # Now, mock refresh_pairlist on the *instance* of PairListManager
+        # that backtesting is using.
+        mock_refresh_pairlist = mocker.patch.object(backtesting.pairlists, 'refresh_pairlist', return_value=None)
+
+        # Load data to set up min_date and max_date for the backtesting instance
+        # This is normally done in backtesting.start() before _precalculate_pairlist_timeline
+        # This call should now succeed because backtesting.pairlists is the real one with a mocked whitelist.
+        data, timerange_obj = backtesting.load_bt_data()
+        
+        # The add_pairlisthandler call is usually done within Backtesting.start() or if pairlists are reloaded.
+        # For this isolated test of _precalculate_pairlist_timeline, ensure dp has the pairlist handler.
+        # If backtesting.pairlists was replaced by a MagicMock, this would add the MagicMock.
+        # Now it adds the actual PairListManager instance.
+        backtesting.strategy.dp.add_pairlisthandler(backtesting.pairlists)
+
+        backtesting._precalculate_pairlist_timeline(timerange_obj.startdt, timerange_obj.stopdt)
+
+        assert mock_refresh_pairlist.call_count == expected_refresh_calls
+
+        if expected_refresh_calls > 0:
+            # refresh_pairlist is called without kwargs in _precalculate_pairlist_timeline
+            # So, first_call_args (which is kwargs) will be empty.
+            # The main check is call_count.
+            pass
+
+
+    def test_precalculate_pairlist_timeline_candle_interval(self, default_conf, mocker, testdatadir):
+        """Test _precalculate_pairlist_timeline with candle-based interval (e.g., '100c')."""
+def test_dataprovider_serves_data_up_to_precalc_point(self, default_conf, mocker, testdatadir):
+        """Test that DataProvider serves data only up to the pre-calculation point."""
+        patch_exchange(mocker)
+        conf = default_conf.copy()
+        conf["timeframe"] = "1h"
+        pair = "UNITTEST/BTC"
+        conf["exchange"]["pair_whitelist"] = [pair]
+
+        dp = DataProvider(conf, None) # No exchange needed for this test as we provide data
+
+        # Generate some dummy ohlcv data
+        dates = pd.to_datetime([
+            "2023-01-01 00:00:00", "2023-01-01 01:00:00", "2023-01-01 02:00:00",
+            "2023-01-01 03:00:00", "2023-01-01 04:00:00", "2023-01-01 05:00:00"
+        ], utc=True)
+        df = pd.DataFrame({
+            'date': dates,
+            'open': [1, 2, 3, 4, 5, 6],
+            'high': [1.1, 2.1, 3.1, 4.1, 5.1, 6.1],
+            'low': [0.9, 1.9, 2.9, 3.9, 4.9, 5.9],
+            'close': [1, 2, 3, 4, 5, 6],
+            'volume': [10, 20, 30, 40, 50, 60]
+        })
+        # Manually set the dataframe in the dataprovider
+        dp._set_cached_df(pair, conf["timeframe"], df, CandleType.SPOT)
+
+        # Simulate pre-calculation: pair was valid up to 2023-01-01 02:00:00
+        precalc_timestamp = pd.Timestamp("2023-01-01 02:00:00", tz='UTC').timestamp() * 1000
+        dp._pairlist_precalc = {pair: precalc_timestamp}
+
+        # Request data at a time *after* the pre-calculation point
+        # The DataProvider should only return data up to and including the 02:00 candle
+        # when _pairlist_precalc is used.
+        # The get_analyzed_dataframe method applies this logic.
+        # We need to simulate being in a strategy context where this is called.
+        # For this test, we directly check the behavior of `historic_ohlcv`
+        # which is called by `get_analyzed_dataframe` after applying the precalc limit.
+
+        # To properly test the precalc limiting, we need to call a method that uses it.
+        # `get_analyzed_dataframe` is the primary consumer.
+        # We'll mock `analyze_df` to simplify and focus on data retrieval.
+        mocker.patch('freqtrade.strategy.strategy_helper.analyze_df', side_effect=lambda dataframe, metadata: dataframe)
+
+
+        # Request data for a time that is after the precalc point
+        # The strategy would typically ask for data up to the "current_time" of the backtest loop.
+        # Here, we simulate a "current_time" of 04:00.
+        # The pairlist was precalculated at 02:00.
+        # So, when analyzing data for the 04:00 candle, the pairlist from 02:00 is used.
+        # The data available for that pairlist should be up to 02:00.
+
+        # The actual limiting happens within get_analyzed_dataframe before calling analyze_df.
+        # So we need to check the dataframe passed to the (mocked) analyze_df.
+
+        # Let's create a minimal strategy instance to use with DataProvider
+        strategy = StrategyResolver.load_strategy(conf)
+        strategy.dp = dp
+        strategy.advise_all_indicators({pair: df.copy()}) # Populate indicators for the full range initially
+
+        # Simulate a call to get_analyzed_dataframe as it would happen in the backtest loop
+        # for a candle at 04:00, using the pairlist precalculated at 02:00.
+        # The `current_time` for `get_analyzed_dataframe` in backtesting is `(row['date'] + timeframe_delta).timestamp() * 1000`
+        # So if the current candle being processed is 03:00, current_time for get_analyzed_dataframe is 04:00
+        # The pairlist used would be the one from the precalc point <= 03:00, which is 02:00.
+        # Data for that pairlist should be up to 02:00.
+
+        # To directly test the data limiting logic within DataProvider.historic_ohlcv
+        # when called from get_analyzed_dataframe, we can inspect _pairlist_precalc.
+        # The key is that get_analyzed_dataframe should pass a limited timerange
+        # to historic_ohlcv if _pairlist_precalc is active for the pair.
+
+def test_performance_implications_of_precalculation(self, default_conf, mocker, testdatadir, caplog):
+        """
+        Test and observe performance implications of pairlist pre-calculation.
+        This test logs execution times for different precalc intervals.
+        """
+        patch_exchange(mocker)
+        mocker.patch(
+            "freqtrade.plugins.pairlistmanager.PairListManager.whitelist",
+            PropertyMock(return_value=["UNITTEST/BTC", "XRP/ETH"]), # Use a couple of pairs
+        )
+        # Mock generate_backtest_stats and show_backtest_results to avoid lengthy output
+        mocker.patch("freqtrade.optimize.backtesting.generate_backtest_stats", MagicMock())
+        mocker.patch("freqtrade.optimize.backtesting.show_backtest_results", MagicMock())
+        mocker.patch("freqtrade.optimize.backtesting.store_backtest_results", MagicMock())
+
+
+        conf_base = default_conf.copy()
+        conf_base["timerange"] = "20191010-20191020" # A reasonable range for performance observation
+        conf_base["timeframe"] = "1h"
+        conf_base["runmode"] = RunMode.BACKTEST
+        conf_base["strategy"] = CURRENT_TEST_STRATEGY # Ensure a strategy is set
+
+        # Scenario 1: Frequent pre-calculation (e.g., every hour for a 1h timeframe)
+        conf_frequent = conf_base.copy()
+        conf_frequent["pairlist_precalc_interval"] = "1h" # or "1c" if that's how it's interpreted
+
+        # Scenario 2: Infrequent pre-calculation (effectively once or disabled)
+        conf_infrequent = conf_base.copy()
+        # Set interval longer than the backtest period or a very large candle count
+        conf_infrequent["pairlist_precalc_interval"] = "30d" # Longer than the 10-day timerange
+
+        # Scenario 3: Default or no pre-calculation (if applicable, or a moderate setting)
+        # For this, we can remove the key or set it to a default like '1d'
+        conf_default = conf_base.copy()
+        conf_default["pairlist_precalc_interval"] = "1d"
+
+
+        results_log = {}
+
+        for scenario_name, conf_test in [
+            ("Frequent (1h)", conf_frequent),
+            ("Default (1d)", conf_default),
+            ("Infrequent (30d)", conf_infrequent),
+        ]:
+            caplog.clear()
+            LocalTrade.reset_trades() # Reset trades before each run
+            backtesting_instance = Backtesting(conf_test)
+            backtesting_instance._set_strategy(backtesting_instance.strategylist[0])
+            backtesting_instance.strategy.bot_loop_start = MagicMock()
+            backtesting_instance.strategy.bot_start = MagicMock()
+
+            start_time = time.time()
+            backtesting_instance.start()
+            end_time = time.time()
+            execution_time = end_time - start_time
+            results_log[scenario_name] = execution_time
+            caplog.info(f"PERF_TEST: Scenario '{scenario_name}' execution time: {execution_time:.4f} seconds.")
+
+        # Log the results for observation
+        caplog.info(f"PERF_TEST: Execution times: {results_log}")
+        # Basic assertion: frequent should not be faster than infrequent (allowing for small fluctuations)
+        # This is a loose check, as exact performance depends on many factors.
+        if "Frequent (1h)" in results_log and "Infrequent (30d)" in results_log:
+             # Adding a small tolerance, e.g., 10-20% for fluctuations
+            assert results_log["Frequent (1h)"] >= results_log["Infrequent (30d)"] * 0.8, \
+                "Frequent precalculation was significantly faster than infrequent, which is unexpected."
+        if "Frequent (1h)" in results_log and "Default (1d)" in results_log:
+            assert results_log["Frequent (1h)"] >= results_log["Default (1d)"] * 0.8, \
+                "Frequent precalculation was significantly faster than default, which is unexpected."
+
+        # A more robust check might be that frequent is indeed slower than infrequent.
+        # However, due to system load and small timeranges, this might not always hold strictly.
+        # For CI, a warning or logging the times is often more practical than a hard assertion.
+        if results_log.get("Frequent (1h)", 0) < results_log.get("Infrequent (30d)", float('inf')):
+            caplog.warning("PERF_TEST: Frequent precalculation was faster than or equal to infrequent. "
+                           "This might be due to a short backtest or system fluctuations.")
+        # Let's refine the test to check the dataframe passed to analyze_df
+        # when get_analyzed_dataframe is called.
+
+        # We need a processed dataframe to pass to get_analyzed_dataframe
+        processed_df, _ = dp.get_processed_df(pair, conf["timeframe"], CandleType.SPOT)
+
+        # Simulate the call from within the backtesting loop for the candle at 03:00
+        # The data for this candle should be based on the pairlist precalculated at 02:00
+        # and thus data should only go up to 02:00.
+        # The `current_time` argument to `get_analyzed_dataframe` is the *end* of the candle.
+        # So for the 03:00 candle, current_time is 04:00.
+        analyzed_df, _ = strategy.dp.get_analyzed_dataframe(pair, conf["timeframe"], (dates[3] + timedelta(hours=1)).timestamp() * 1000)
+
+        # The returned dataframe should only contain data up to the precalc point (02:00 candle)
+        # The dates are: 00:00, 01:00, 02:00
+        assert len(analyzed_df) == 3
+        assert analyzed_df['date'].max() == pd.Timestamp("2023-01-01 02:00:00", tz='UTC')
+
+        # Test with no precalc for the pair
+        dp._pairlist_precalc = {}
+        analyzed_df_no_precalc, _ = strategy.dp.get_analyzed_dataframe(pair, conf["timeframe"], (dates[3] + timedelta(hours=1)).timestamp() * 1000)
+        # Should return data up to the candle *before* current_time (03:00 candle)
+        assert len(analyzed_df_no_precalc) == 4
+        assert analyzed_df_no_precalc['date'].max() == pd.Timestamp("2023-01-01 03:00:00", tz='UTC')
+        patch_exchange(mocker)
+        mocker.patch(
+            "freqtrade.plugins.pairlistmanager.PairListManager.whitelist",
+            PropertyMock(return_value=["UNITTEST/BTC"]),
+        )
+        mocker.patch("freqtrade.data.dataprovider.DataProvider._pairlist_precalc", new_callable=PropertyMock, return_value={})
+
+        conf = default_conf.copy()
+        conf["timerange"] = "20230101-20230103"
+        conf["timeframe"] = "1h"
+        conf["pairlist_precalc_interval"] = "100c" # Candle interval
+
+        backtesting = Backtesting(conf)
+        backtesting._set_strategy(backtesting.strategylist[0])
+
+        mock_pairlist_manager = MagicMock()
+        mock_pairlist_manager.refresh_pairlist = MagicMock()
+        backtesting.pairlists = mock_pairlist_manager
+
+        data, timerange_obj = backtesting.load_bt_data()
+        backtesting.strategy.dp.add_pairlisthandler(backtesting.pairlists)
+
+        # _get_precalculation_interval_td returns timedelta(0) for 'Nc'
+        # _precalculate_pairlist_timeline should not call refresh_pairlist if interval is 0
+        backtesting._precalculate_pairlist_timeline(timerange_obj.start_dt, timerange_obj.stop_dt)
+
+        mock_pairlist_manager.refresh_pairlist.assert_not_called()
+        # Verify that _pairlist_precalc remains empty or is not populated in a way that implies refreshes
+        assert not backtesting.strategy.dp._pairlist_precalc

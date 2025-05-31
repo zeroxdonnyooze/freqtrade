@@ -22,7 +22,7 @@ class PairListResolver(IResolver):
 
     object_type = IPairList
     object_type_str = "Pairlist"
-    user_subdir = None
+    user_subdir = "pairlists"  # Look in user_data/pairlists
     initial_search_path = Path(__file__).parent.parent.joinpath("plugins/pairlist").resolve()
 
     @staticmethod

@@ -236,6 +236,7 @@ Mandatory parameters are marked as **Required**, which means that they are requi
 | | **Plugins**
 | `edge.*` | Please refer to [edge configuration document](edge.md) for detailed explanation of all possible configuration options.
 | `pairlists` | Define one or more pairlists to be used. [More information](plugins.md#pairlists-and-pairlist-handlers). <br>*Defaults to `StaticPairList`.*  <br> **Datatype:** List of Dicts
+| `pairlist_precalc_interval` | Interval for pairlist pre-calculation during backtesting. Defines how often the dynamic pairlist is re-evaluated based on historical data. Valid values include: "daily", "weekly", "monthly", a number of candles (e.g., "100c" - note: 'Nc' currently disables precalculation during the main backtest loop, relying on initial precalculation only), or time strings like "1d", "4h". This setting is crucial for realistic backtesting of dynamic pairlists. See [Backtesting Documentation](backtesting.md#enhanced-dynamic-pairlist-backtesting-approach-b---pre-calculation) for more details. <br>*Defaults to `"1d"` (daily) if not specified and a dynamic pairlist is used in backtesting.* <br> **Datatype:** String
 | | **Telegram**
 | `telegram.enabled` | Enable the usage of Telegram. <br> **Datatype:** Boolean
 | `telegram.token` | Your Telegram bot token. Only required if `telegram.enabled` is `true`. <br>**Keep it in secret, do not disclose publicly.** <br> **Datatype:** String

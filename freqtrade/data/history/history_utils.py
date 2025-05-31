@@ -39,6 +39,7 @@ def load_pair_history(
     data_handler: IDataHandler | None = None,
     candle_type: CandleType = CandleType.SPOT,
 ) -> DataFrame:
+    
     """
     Load cached ohlcv history for the given pair.
 
@@ -56,8 +57,8 @@ def load_pair_history(
     :return: DataFrame with ohlcv data, or empty DataFrame
     """
     data_handler = get_datahandler(datadir, data_format, data_handler)
-
-    return data_handler.ohlcv_load(
+    # LPH_DEBUG logs removed
+    df_result = data_handler.ohlcv_load(
         pair=pair,
         timeframe=timeframe,
         timerange=timerange,
@@ -66,6 +67,8 @@ def load_pair_history(
         startup_candles=startup_candles,
         candle_type=candle_type,
     )
+    # LPH_DEBUG log removed
+    return df_result
 
 
 def load_data(

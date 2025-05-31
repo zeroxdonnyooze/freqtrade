@@ -58,6 +58,7 @@ AVAILABLE_PAIRLISTS = [
     "ShuffleFilter",
     "SpreadFilter",
     "VolatilityFilter",
+    "TopMoversPairList", # Add our custom pairlist
 ]
 AVAILABLE_DATAHANDLERS = ["json", "jsongz", "feather", "parquet"]
 BACKTEST_BREAKDOWNS = ["day", "week", "month", "year"]

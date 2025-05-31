@@ -23,11 +23,32 @@ The result of backtesting will confirm if your bot has better odds of making a p
 All profit calculations include fees, and freqtrade will use the exchange's default fees for the calculation.
 
 !!! Warning "Using dynamic pairlists for backtesting"
-    Using dynamic pairlists is possible (not all of the handlers are allowed to be used in backtest mode), however it relies on the current market conditions - which will not reflect the historic status of the pairlist.
-    Also, when using pairlists other than StaticPairlist, reproducibility of backtesting-results cannot be guaranteed.
-    Please read the [pairlists documentation](plugins.md#pairlists) for more information.
+    Using dynamic pairlists is possible (not all of the handlers are allowed to be used in backtest mode).
+    Historically, backtesting dynamic pairlists relied on current market conditions at the time of the backtest, which did not accurately reflect the historic state of the pairlist. This could lead to unrealistic results and limited reproducibility.
 
-    To achieve reproducible results, best generate a pairlist via the [`test-pairlist`](utils.md#test-pairlist) command and use that as static pairlist.
+    **Enhanced Dynamic Pairlist Backtesting (Approach B - Pre-calculation):**
+
+    Freqtrade now offers an enhanced method for backtesting dynamic pairlists that significantly improves accuracy and realism. This approach involves pre-calculating the pairlist at regular intervals throughout the backtesting period.
+
+    **How it works:**
+    - Before the main backtest loop begins, Freqtrade iterates through your specified `timerange` at intervals defined by the [`pairlist_precalc_interval`](configuration.md#pairlist_precalc_interval) configuration setting.
+    - At each interval, your dynamic pairlist handler's `refresh_pairlist` method is called with the historical context of that specific point in time.
+    - The pairlist generated at each interval is stored.
+    - During the actual backtesting run, when processing a particular candle, Freqtrade uses the pre-calculated pairlist that was valid for that candle's timestamp.
+    - This ensures that the pair selection logic is based on historical data relevant to each point in the backtest, preventing lookahead bias from using "future" pairlist states.
+
+    **Benefits:**
+    - **More Realistic Results:** Pairlist decisions are made based on historical data, closely simulating how a dynamic pairlist would have behaved live.
+    - **Improved Reproducibility:** While still dependent on the pairlist logic, this method reduces variability caused by running backtests at different times with different "current" market states.
+    - **Better Strategy Evaluation:** Allows for more accurate assessment of strategies that rely on dynamically changing pairlists.
+
+    **Configuration:**
+    - The frequency of these pre-calculations is controlled by the `pairlist_precalc_interval` setting in your configuration file. See the [configuration documentation](configuration.md#pairlist_precalc_interval) for details.
+
+    **For Pairlist Developers:**
+    - When creating custom dynamic pairlist handlers, ensure your `refresh_pairlist` method can operate correctly when provided with historical data context. The `min_date` and `max_date` arguments passed to `refresh_pairlist` during pre-calculation will define the historical window for that specific refresh. More details can be found in the [pairlist plugin documentation](plugins.md#pairlists).
+
+    While this enhanced method improves realism, for absolute reproducibility (e.g., for sharing exact backtest results), generating a static pairlist via the [`test-pairlist`](utils.md#test-pairlist) command and using that remains a valid option.
 
 !!! Note
     By default, Freqtrade will export backtesting results to `user_data/backtest_results`.

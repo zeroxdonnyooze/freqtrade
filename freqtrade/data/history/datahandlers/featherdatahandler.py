@@ -29,6 +29,7 @@ class FeatherDataHandler(IDataHandler):
         :return: None
         """
         filename = self._pair_data_filename(self._datadir, pair, timeframe, candle_type)
+        # logger.info(f"FDH_STORE: Storing data for {pair} {timeframe} {candle_type} to {filename}")
         self.create_dir_if_needed(filename)
 
         data.reset_index(drop=True).loc[:, self._columns].to_feather(
@@ -51,15 +52,27 @@ class FeatherDataHandler(IDataHandler):
         :return: DataFrame with ohlcv data, or empty DataFrame
         """
         filename = self._pair_data_filename(self._datadir, pair, timeframe, candle_type=candle_type)
+        # logger.info(f"FDH_LOAD: Initial attempt for {pair} {timeframe} {candle_type} using file: {filename}")
         if not filename.exists():
+            # logger.info(f"FDH_LOAD: Primary file {filename} does not exist. Attempting fallback.")
             # Fallback mode for 1M files
-            filename = self._pair_data_filename(
+            filename_fallback_path = self._pair_data_filename( # Use a temp name for clarity
                 self._datadir, pair, timeframe, candle_type=candle_type, no_timeframe_modify=True
             )
-            if not filename.exists():
+            # logger.info(f"FDH_LOAD: Fallback filename is {filename_fallback_path}")
+            if not filename_fallback_path.exists():
+                # logger.info(f"FDH_LOAD: Fallback file {filename_fallback_path} also does not exist. Returning empty DataFrame for {pair} {timeframe} {candle_type}.")
                 return DataFrame(columns=self._columns)
+            else:
+                # logger.info(f"FDH_LOAD: Fallback file {filename_fallback_path} exists. Using this file for {pair} {timeframe} {candle_type}.")
+                filename = filename_fallback_path # Assign to filename to be used by try block
+        else:
+            pass
+            # logger.info(f"FDH_LOAD: Primary file {filename} exists for {pair} {timeframe} {candle_type}.")
+
         try:
             pairdata = read_feather(filename)
+            # logger.info(f"FDH_LOAD: Successfully read {len(pairdata)} rows from {filename} for {pair} {timeframe} {candle_type}.")
             pairdata.columns = self._columns
             pairdata = pairdata.astype(
                 dtype={
@@ -73,9 +86,9 @@ class FeatherDataHandler(IDataHandler):
             pairdata["date"] = to_datetime(pairdata["date"], unit="ms", utc=True)
             return pairdata
         except Exception as e:
-            logger.exception(
-                f"Error loading data from {filename}. Exception: {e}. Returning empty dataframe."
-            )
+            # logger.exception(
+            #     f"FDH_LOAD: Error loading data from {filename} for {pair} {timeframe} {candle_type}. Exception: {e}. Returning empty dataframe."
+            # )
             return DataFrame(columns=self._columns)
 
     def ohlcv_append(

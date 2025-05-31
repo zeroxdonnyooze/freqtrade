@@ -292,12 +292,19 @@ class DataProvider:
         """
         self._pairlists = pairlists
 
-    def historic_ohlcv(self, pair: str, timeframe: str, candle_type: str = "") -> DataFrame:
+    def historic_ohlcv(
+        self,
+        pair: str,
+        timeframe: str,
+        candle_type: str = "",
+        current_backtest_timestamp: datetime | None = None,
+    ) -> DataFrame:
         """
-        Get stored historical candle (OHLCV) data
+        Get stored historical candle (OHLCV) data, optionally limited to current_backtest_timestamp.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
         :param candle_type: '', mark, index, premiumIndex, or funding_rate
+        :param current_backtest_timestamp: If provided, data is returned up to this timestamp (inclusive).
         """
         _candle_type = (
             CandleType.from_string(candle_type)
@@ -312,24 +319,45 @@ class DataProvider:
                 else str(self._config.get("timerange"))
             )
 
-            startup_candles = self.get_required_startup(str(timeframe))
+            # Determine startup_candles based on whether it's an informative pair or main timeframe
+            # For informative pairs, config['informative_startup_candle_count'] should be used if available.
+            informative_startup_config = self._config.get('informative_startup_candle_count', {})
+            # DP_DEBUG_HISTORIC_PRE_CHECK logs removed
+
+            if isinstance(informative_startup_config, dict) and str(timeframe) in informative_startup_config:
+                startup_candles = informative_startup_config[str(timeframe)] # Use str(timeframe) for key
+                # logger.info(f"DP_DEBUG_HISTORIC: Using informative_startup_candle_count for {pair} {timeframe}: {startup_candles}")
+            else:
+                startup_candles = self.get_required_startup(str(timeframe))
+                # logger.info(f"DP_DEBUG_HISTORIC: Using get_required_startup for {pair} {timeframe}: {startup_candles}")
+
             tf_seconds = timeframe_to_seconds(str(timeframe))
-            timerange.subtract_start(tf_seconds * startup_candles)
-
-            logger.info(
-                f"Loading data for {pair} {timeframe} "
-                f"from {timerange.start_fmt} to {timerange.stop_fmt}"
+            # Create a new Timerange object for this specific call to avoid modifying the global one
+            current_timerange = TimeRange.parse_timerange(
+                None if self._config.get("timerange") is None else str(self._config.get("timerange"))
             )
+            current_timerange.subtract_start(tf_seconds * startup_candles)
 
+ 
             self.__cached_pairs_backtesting[saved_pair] = load_pair_history(
                 pair=pair,
                 timeframe=timeframe,
                 datadir=self._config["datadir"],
-                timerange=timerange,
+                timerange=current_timerange, # Use the locally adjusted timerange
                 data_format=self._config["dataformat_ohlcv"],
                 candle_type=_candle_type,
+                startup_candles=startup_candles,
             )
-        return self.__cached_pairs_backtesting[saved_pair].copy()
+           
+ 
+        # The following block is now at the same indentation level as the
+        # `if saved_pair not in self.__cached_pairs_backtesting:` block (line 315)
+        # and the `return data_df` statement (line 343).
+        data_df = self.__cached_pairs_backtesting[saved_pair].copy()
+        
+        if current_backtest_timestamp:
+            data_df = data_df.loc[data_df["date"] <= current_backtest_timestamp]
+        return data_df
 
     def get_required_startup(self, timeframe: str) -> int:
         freqai_config = self._config.get("freqai", {})
@@ -349,7 +377,11 @@ class DataProvider:
         return total_candles
 
     def get_pair_dataframe(
-        self, pair: str, timeframe: str | None = None, candle_type: str = ""
+        self,
+        pair: str,
+        timeframe: str | None = None,
+        candle_type: str = "",
+        current_backtest_timestamp: datetime | None = None,
     ) -> DataFrame:
         """
         Return pair candle (OHLCV) data, either live or cached historical -- depending
@@ -358,23 +390,32 @@ class DataProvider:
         will be available.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
-        :return: Dataframe for this pair
         :param candle_type: '', mark, index, premiumIndex, or funding_rate
+        :param current_backtest_timestamp: If provided (only in backtesting modes),
+                                           data is returned up to this timestamp.
+        :return: Dataframe for this pair
         """
         if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
             # Get live OHLCV data.
+            # current_backtest_timestamp is not applicable in live/dry run.
             data = self.ohlcv(pair=pair, timeframe=timeframe, candle_type=candle_type)
         else:
             # Get historical OHLCV data (cached on disk).
             timeframe = timeframe or self._config["timeframe"]
-            data = self.historic_ohlcv(pair=pair, timeframe=timeframe, candle_type=candle_type)
-            # Cut date to timeframe-specific date.
+            data = self.historic_ohlcv(
+                pair=pair,
+                timeframe=timeframe,
+                candle_type=candle_type,
+                current_backtest_timestamp=current_backtest_timestamp,
+            )
+            # Cut date to timeframe-specific date for informative pairs.
             # This is necessary to prevent lookahead bias in callbacks through informative pairs.
+            # This applies on top of current_backtest_timestamp if both are relevant.
             if self.__slice_date:
                 cutoff_date = timeframe_to_prev_date(timeframe, self.__slice_date)
                 data = data.loc[data["date"] < cutoff_date]
         if len(data) == 0:
-            logger.warning(f"No data found for ({pair}, {timeframe}, {candle_type}).")
+            logger.debug(f"No data found for ({pair}, {timeframe}, {candle_type}).")
         return data
 
     def get_analyzed_dataframe(self, pair: str, timeframe: str) -> tuple[DataFrame, datetime]:

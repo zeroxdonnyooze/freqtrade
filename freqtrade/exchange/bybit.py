@@ -64,7 +64,7 @@ class Bybit(Exchange):
 
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         # TradingMode.SPOT always supported and not required in this list
-        # (TradingMode.FUTURES, MarginMode.CROSS),
+        (TradingMode.FUTURES, MarginMode.CROSS),
         (TradingMode.FUTURES, MarginMode.ISOLATED)
     ]
 
@@ -194,24 +194,42 @@ class Bybit(Exchange):
         market = self.markets[pair]
         mm_ratio, _ = self.get_maintenance_ratio_and_amt(pair, stake_amount)
 
-        if self.trading_mode == TradingMode.FUTURES and self.margin_mode == MarginMode.ISOLATED:
-            if market["inverse"]:
-                raise OperationalException("Freqtrade does not yet support inverse contracts")
-            position_value = amount * open_rate
-            initial_margin = position_value / leverage
-            maintenance_margin = position_value * mm_ratio
-            margin_diff_per_contract = (initial_margin - maintenance_margin) / amount
+        if self.trading_mode == TradingMode.FUTURES:
+            if self.margin_mode == MarginMode.ISOLATED:
+                if market["inverse"]:
+                    logger.warning(
+                        "Freqtrade does not yet support inverse contracts for Bybit "
+                        "isolated margin dry_run_liquidation_price."
+                    )
+                    return None
+                position_value = amount * open_rate
+                initial_margin = position_value / leverage
+                maintenance_margin = position_value * mm_ratio
+                margin_diff_per_contract = (initial_margin - maintenance_margin) / amount
 
-            # See docstring - ignores extra margin!
-            if is_short:
-                return open_rate + margin_diff_per_contract
+                # See docstring - ignores extra margin!
+                if is_short:
+                    return open_rate + margin_diff_per_contract
+                else:
+                    return open_rate - margin_diff_per_contract
+            elif self.margin_mode == MarginMode.CROSS:
+                # For CROSS margin on Bybit, defer to the generic calculation
+                # by returning None. The generic calculator will be called by Backtesting.
+                logger.debug(
+                    f"Bybit.dry_run_liquidation_price: Deferring to generic calculation "
+                    f"for CROSS margin on {pair}."
+                )
+                return None
             else:
-                return open_rate - margin_diff_per_contract
-
+                # Should ideally not be reached if config validation is robust
+                logger.warning(
+                    f"Bybit.dry_run_liquidation_price: Unsupported margin mode "
+                    f"{self.margin_mode} for futures on {pair}. Returning None."
+                )
+                return None
         else:
-            raise OperationalException(
-                "Freqtrade only supports isolated futures for leverage trading"
-            )
+            # Not futures mode, no leverage based liquidation price applicable from this method
+            return None
 
     def get_funding_fees(
         self, pair: str, amount: float, is_short: bool, open_date: datetime

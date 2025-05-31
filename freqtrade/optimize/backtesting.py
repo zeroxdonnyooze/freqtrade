@@ -8,6 +8,12 @@ import logging
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import ccxt # Add import for ccxt
+from ccxt.base.errors import ExchangeError # Import ExchangeError directly
+import json
+import hashlib
+from pathlib import Path
 
 from numpy import isnan, nan
 from pandas import DataFrame, Series
@@ -78,6 +84,8 @@ from freqtrade.wallets import Wallets
 
 logger = logging.getLogger(__name__)
 
+PAIRLIST_TIMELINE_CACHE_DIR = "pairlist_cache"
+
 # Indexes for backtest tuples
 DATE_IDX = 0
 OPEN_IDX = 1
@@ -135,6 +143,9 @@ class Backtesting:
             "exited": {},
         }
         self.rejected_dict: dict[str, list] = {}
+        self.pairlist_timeline: Dict[datetime, List[str]] = {}
+        self.precalculation_interval_str: str = self.config.get("pairlist_precalc_interval", "1d")
+
 
         self._exchange_name = self.config["exchange"]["name"]
         if not exchange:
@@ -284,60 +295,304 @@ class Backtesting:
 
         self.strategy.ft_bot_start()
 
+    def _get_precalculation_interval_td(self) -> timedelta:
+        """
+        Converts the precalculation_interval_str to a timedelta.
+        Supports 'daily', 'weekly', 'monthly', or a number of candles (e.g., '100c').
+        """
+        interval_str = self.precalculation_interval_str.lower()
+        if interval_str == "daily":
+            return timedelta(days=1)
+        elif interval_str == "weekly":
+            return timedelta(weeks=1)
+        elif interval_str == "monthly":
+            # Approximate, actual month length varies. For pre-calculation, this is acceptable.
+            return timedelta(days=30)
+        elif interval_str.endswith("c"):
+            try:
+                num_candles = int(interval_str[:-1])
+                if num_candles <= 0:
+                    raise ValueError("Candle interval must be positive.")
+                return timedelta(seconds=self.timeframe_secs * num_candles)
+            except ValueError as e:
+                raise OperationalException(
+                    f"Invalid pairlist_precalc_interval candle format: '{self.precalculation_interval_str}'. "
+                    f"Expected format like '100c'. Error: {e}"
+                )
+        else:
+            # Try to parse as a timeframe string (e.g., '1h', '4h')
+            try:
+                return timedelta(seconds=timeframe_to_seconds(interval_str))
+            except ExchangeError as e:  # Catch ccxt's NotSupported and other exchange errors
+                raise OperationalException(
+                    f"Invalid pairlist_precalc_interval timeframe string: '{self.precalculation_interval_str}'. "
+                    f"Error: {e}"
+                ) from e
+            except ValueError: # General catch for other unexpected format issues
+                raise OperationalException(
+                    f"Invalid pairlist_precalc_interval: '{self.precalculation_interval_str}'. "
+                    "Supported values: 'daily', 'weekly', 'monthly', '<N>c' (e.g., '100c'), "
+                    "or a valid timeframe string (e.g., '1h', '4d')."
+                )
+
+    def _precalculate_pairlist_timeline(self, min_date: datetime, max_date: datetime):
+        """
+        Pre-calculates the pairlist timeline for the entire backtest range.
+        Uses a file-based cache to store/retrieve timelines for specific pairlist configurations.
+        """
+        logger.info("Attempting to load or pre-calculate pairlist timeline...")
+        self.progress.init_step(BacktestState.PAIRLIST_PRECALC, 0)  # Will be re-initialized later
+        self.pairlist_timeline = {}
+
+        # 1. Determine Cache Filename
+        cache_file: Path | None = None
+        try:
+            active_pairlist_name = self.pairlists.name_list[0] if self.pairlists.name_list else "UnknownPairlist"
+            logger.debug(f"Attempting to find config for active_pairlist_name: '{active_pairlist_name}'")
+            pairlist_cfg_for_hash = {}
+            
+            pairlists_config_list = self.config.get('pairlists', [])
+            logger.debug(f"Full pairlists config from self.config.get('pairlists', []): {pairlists_config_list}")
+
+            if active_pairlist_name != "UnknownPairlist":
+                for idx, pairlist_entry in enumerate(pairlists_config_list):
+                    logger.debug(f"Checking pairlist_entry #{idx}: {pairlist_entry}")
+                    if isinstance(pairlist_entry, dict):
+                        entry_method_name = pairlist_entry.get('method')
+                        logger.debug(f"  Entry method name: '{entry_method_name}'")
+                        # Standard format: {"method": "MyPairList", "other_config": "value"}
+                        if entry_method_name == active_pairlist_name:
+                            logger.debug(f"  Match found for '{active_pairlist_name}' using 'method' key.")
+                            pairlist_cfg_for_hash = {
+                                k: v for k, v in pairlist_entry.items() if k != 'method'
+                            }
+                            break
+                        # Older/alternative format (less likely for named pairlists from list): {"MyPairList": {"other_config": "value"}}
+                        elif active_pairlist_name in pairlist_entry and isinstance(pairlist_entry[active_pairlist_name], dict):
+                            logger.debug(f"  Match found for '{active_pairlist_name}' as a direct key.")
+                            pairlist_cfg_for_hash = pairlist_entry[active_pairlist_name]
+                            break
+                        else:
+                            logger.debug(f"  No match in pairlist_entry #{idx} for '{active_pairlist_name}'.")
+                    else:
+                        logger.debug(f"  pairlist_entry #{idx} is not a dict: {type(pairlist_entry)}")
+            
+            logger.debug(f"Final pairlist_cfg_for_hash for '{active_pairlist_name}': {pairlist_cfg_for_hash}")
+            if not pairlist_cfg_for_hash and active_pairlist_name not in ('StaticPairList', "UnknownPairlist"):
+                logger.warning(
+                    f"Could not find specific configuration for pairlist '{active_pairlist_name}' "
+                    f"in config['pairlists'] for cache key generation. Using empty dict."
+                )
+
+            hash_content_str = (
+                f"{self.config['exchange']['name']}:"
+                f"{self.config['stake_currency']}:"
+                f"{active_pairlist_name}:"
+                f"{json.dumps(pairlist_cfg_for_hash, sort_keys=True)}:"
+                f"{self.timeframe}"
+            )
+            cache_filename_hash = hashlib.sha256(hash_content_str.encode('utf-8')).hexdigest()
+            cache_dir = Path(self.config['user_data_dir']) / PAIRLIST_TIMELINE_CACHE_DIR
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / f"{cache_filename_hash}.json"
+            logger.debug(f"Pairlist timeline cache file: {cache_file}")
+
+        except Exception as e:
+            logger.error(f"Error generating cache filename for pairlist timeline: {e}. Skipping cache.")
+            # cache_file remains None
+
+        master_cached_timeline_str_keys: Dict[str, List[str]] = {}
+        if cache_file:
+            try:
+                if cache_file.exists():
+                    with cache_file.open('r') as f:
+                        master_cached_timeline_str_keys = json.load(f)
+                    logger.info(f"Loaded master pairlist timeline from cache: {cache_file}")
+            except Exception as e:
+                logger.warning(
+                    f"Could not load pairlist timeline cache from {cache_file}: {e}. Will recompute."
+                )
+                master_cached_timeline_str_keys = {}
+
+        interval_td = self._get_precalculation_interval_td()
+        if interval_td.total_seconds() == 0:
+            logger.warning("Pairlist pre-calculation interval is zero, skipping.")
+            self.progress.init_step(BacktestState.PAIRLIST_PRECALC, 1)
+            self.progress.set_new_value(1)
+            return
+
+        current_run_timeline_dt_keys: Dict[datetime, List[str]] = {}
+        original_slice_date = self.dataprovider._DataProvider__slice_date  # type: ignore
+
+        num_steps = 0
+        temp_eval_time = min_date
+        while temp_eval_time <= max_date:
+            num_steps += 1
+            temp_eval_time += interval_td
+        if num_steps == 0 and min_date <= max_date:
+            num_steps = 1
+
+        self.progress.init_step(BacktestState.PAIRLIST_PRECALC, num_steps if num_steps > 0 else 1)
+        step_count = 0
+        needs_save = False
+        current_eval_time = min_date
+
+        while current_eval_time <= max_date:
+            self.check_abort()
+            iso_key = current_eval_time.isoformat()
+
+            if iso_key in master_cached_timeline_str_keys:
+                current_whitelist = master_cached_timeline_str_keys[iso_key]
+                logger.debug(
+                    f"Using cached pairlist for {current_eval_time.strftime(DATETIME_PRINT_FORMAT)}: "
+                    f"{len(current_whitelist)} pairs"
+                )
+            else:
+                logger.debug(
+                    f"Computing pairlist for {current_eval_time.strftime(DATETIME_PRINT_FORMAT)}"
+                )
+                self.dataprovider._set_dataframe_max_date(current_eval_time)
+                self.pairlists.refresh_pairlist()
+                current_whitelist = self.pairlists.whitelist.copy()
+                master_cached_timeline_str_keys[iso_key] = current_whitelist
+                needs_save = True
+                logger.debug(
+                    f"Computed whitelist for {current_eval_time.strftime(DATETIME_PRINT_FORMAT)}: "
+                    f"{len(current_whitelist)} pairs"
+                )
+
+            current_run_timeline_dt_keys[current_eval_time] = current_whitelist
+
+            current_eval_time += interval_td
+            step_count += 1
+            self.progress.set_new_value(step_count)
+
+            # Handle final point if interval_td doesn't align perfectly with max_date
+            # and max_date has not been processed yet.
+            if current_eval_time > max_date and max_date not in current_run_timeline_dt_keys:
+                final_eval_time = max_date
+                final_iso_key = final_eval_time.isoformat()
+                if final_iso_key in master_cached_timeline_str_keys:
+                    final_whitelist = master_cached_timeline_str_keys[final_iso_key]
+                    logger.debug(
+                        f"Using cached pairlist for final point "
+                        f"{final_eval_time.strftime(DATETIME_PRINT_FORMAT)}: {len(final_whitelist)} pairs"
+                    )
+                else:
+                    logger.debug(
+                        f"Computing pairlist for final point "
+                        f"{final_eval_time.strftime(DATETIME_PRINT_FORMAT)}"
+                    )
+                    self.dataprovider._set_dataframe_max_date(final_eval_time)
+                    self.pairlists.refresh_pairlist()
+                    final_whitelist = self.pairlists.whitelist.copy()
+                    master_cached_timeline_str_keys[final_iso_key] = final_whitelist
+                    needs_save = True
+                    logger.debug(
+                        f"Computed whitelist for final point "
+                        f"{final_eval_time.strftime(DATETIME_PRINT_FORMAT)}: {len(final_whitelist)} pairs"
+                    )
+                current_run_timeline_dt_keys[final_eval_time] = final_whitelist
+                # Ensure progress reflects this potential extra step if it wasn't the last one counted
+                if step_count <= num_steps : # Check if this step was already counted or is an "extra" one
+                    self.progress.set_new_value(min(step_count +1, num_steps if num_steps > 0 else 1))
+
+
+        self.dataprovider._set_dataframe_max_date(original_slice_date)
+
+        if cache_file and needs_save:
+            try:
+                with cache_file.open('w') as f:
+                    json.dump(master_cached_timeline_str_keys, f, indent=2) # indent for readability
+                logger.info(f"Saved updated pairlist timeline to cache: {cache_file}")
+            except Exception as e:
+                logger.error(f"Could not save pairlist timeline cache to {cache_file}: {e}")
+
+        self.pairlist_timeline = current_run_timeline_dt_keys
+        logger.info(
+            f"Pairlist timeline pre-calculation complete. "
+            f"{len(self.pairlist_timeline)} timeline entries for current run."
+        )
+        if num_steps == 0: # Should ideally not happen if min_date <= max_date
+            self.progress.init_step(BacktestState.PAIRLIST_PRECALC, 1) # Ensure init
+            self.progress.set_new_value(1) # Mark as complete
+        elif self.progress._max_steps and step_count < self.progress._max_steps:
+             self.progress.set_new_value(self.progress._max_steps) # Ensure 100%
+
+
     def _load_protections(self, strategy: IStrategy):
         if self.config.get("enable_protections", False):
             self.protections = ProtectionManager(self.config, strategy.protections)
 
-    def load_bt_data(self) -> tuple[dict[str, DataFrame], TimeRange]:
+    def load_bt_data(self, pairs_to_load: Optional[List[str]] = None) -> tuple[dict[str, DataFrame], TimeRange]:
         """
         Loads backtest data and returns the data combined with the timerange
         as tuple.
+        :param pairs_to_load: Optional list of pairs to load. If None, uses self.pairlists.whitelist.
         """
+        effective_pairs = pairs_to_load if pairs_to_load is not None else self.pairlists.whitelist
+        if not effective_pairs:
+            logger.warning("load_bt_data called with no effective pairs to load. Returning empty data.")
+            # Return a copy of timerange to avoid modification issues if it's used later
+            return {}, deepcopy(self.timerange)
+
         self.progress.init_step(BacktestState.DATALOAD, 1)
 
         data = history.load_data(
             datadir=self.config["datadir"],
-            pairs=self.pairlists.whitelist,
+            pairs=effective_pairs, # Use effective_pairs
             timeframe=self.timeframe,
-            timerange=self.timerange,
+            timerange=self.timerange, # self.timerange is used by history.load_data
             startup_candles=self.required_startup,
-            fail_without_data=True,
+            fail_without_data=False, # Set to False to allow loading partial data if some superset pairs are missing
             data_format=self.config["dataformat_ohlcv"],
             candle_type=self.config.get("candle_type_def", CandleType.SPOT),
         )
 
-        min_date, max_date = history.get_timerange(data)
+        if not data: # Check if history.load_data returned an empty dict
+            logger.warning(f"No data loaded for any of the {len(effective_pairs)} effective pairs. "
+                           f"Pairs attempted: {effective_pairs[:20]}")
+            # Return a copy of timerange
+            return {}, deepcopy(self.timerange)
 
-        logger.info(
-            f"Loading data from {min_date.strftime(DATETIME_PRINT_FORMAT)} "
-            f"up to {max_date.strftime(DATETIME_PRINT_FORMAT)} "
-            f"({(max_date - min_date).days} days)."
-        )
+        min_date, max_date = history.get_timerange(data) # Will be based on actually loaded data
 
-        # Adjust startts forward if not enough data is available
-        self.timerange.adjust_start_if_necessary(
+        # Adjust startts forward if not enough data is available for the loaded set
+        # This adjustment is critical and should use min_date from the *actually loaded data for these effective_pairs*
+        current_timerange_to_adjust = deepcopy(self.timerange) # Use a copy for this specific load's adjustment context
+        current_timerange_to_adjust.adjust_start_if_necessary(
             timeframe_to_seconds(self.timeframe), self.required_startup, min_date
         )
 
         self.progress.set_new_value(1)
-        self._load_bt_data_detail()
+        self._load_bt_data_detail(pairs_for_detail=list(data.keys())) # Pass actually loaded pairs
         self.price_pair_prec = {}
-        for pair in self.pairlists.whitelist:
-            if pair in data:
+        for pair in data.keys(): # Iterate over keys of actually loaded data
+            if pair in data: # Redundant check, but safe
                 # Load price precision logic
                 self.price_pair_prec[pair] = get_tick_size_over_time(data[pair])
-        return data, self.timerange
+        # Return the timerange that was potentially adjusted for *this specific call*
+        return data, current_timerange_to_adjust
 
-    def _load_bt_data_detail(self) -> None:
+    def _load_bt_data_detail(self, pairs_for_detail: Optional[List[str]] = None) -> None:
         """
         Loads backtest detail data (smaller timeframe) if necessary.
+        :param pairs_for_detail: Optional list of pairs for which to load detail data.
+                               If None, defaults to self.pairlists.whitelist (legacy behavior).
         """
+        effective_pairs = pairs_for_detail if pairs_for_detail is not None else self.pairlists.whitelist
+        if not effective_pairs:
+            logger.debug("_load_bt_data_detail called with no effective_pairs. Skipping detail/futures data load.")
+            self.detail_data = {}
+            self.futures_data = {}
+            return
+
         if self.timeframe_detail:
             self.detail_data = history.load_data(
                 datadir=self.config["datadir"],
-                pairs=self.pairlists.whitelist,
+                pairs=effective_pairs, # Use effective_pairs
                 timeframe=self.timeframe_detail,
-                timerange=self.timerange,
+                timerange=self.timerange, # Uses the main backtest timerange
                 startup_candles=0,
                 fail_without_data=True,
                 data_format=self.config["dataformat_ohlcv"],
@@ -353,11 +608,11 @@ class Backtesting:
             # Load additional futures data.
             funding_rates_dict = history.load_data(
                 datadir=self.config["datadir"],
-                pairs=self.pairlists.whitelist,
+                pairs=effective_pairs, # Use effective_pairs
                 timeframe=funding_fee_timeframe,
-                timerange=self.timerange,
+                timerange=self.timerange, # Uses the main backtest timerange
                 startup_candles=0,
-                fail_without_data=True,
+                fail_without_data=False, # Allow partial data for futures info
                 data_format=self.config["dataformat_ohlcv"],
                 candle_type=CandleType.FUNDING_RATE,
             )
@@ -365,20 +620,26 @@ class Backtesting:
             # For simplicity, assign to CandleType.Mark (might contain index candles!)
             mark_rates_dict = history.load_data(
                 datadir=self.config["datadir"],
-                pairs=self.pairlists.whitelist,
+                pairs=effective_pairs, # Use effective_pairs
                 timeframe=mark_timeframe,
-                timerange=self.timerange,
+                timerange=self.timerange, # Uses the main backtest timerange
                 startup_candles=0,
-                fail_without_data=True,
+                fail_without_data=False, # Allow partial data for futures info
                 data_format=self.config["dataformat_ohlcv"],
                 candle_type=CandleType.from_string(self.exchange.get_option("mark_ohlcv_price")),
             )
             # Combine data to avoid combining the data per trade.
             unavailable_pairs = []
             uses_leverage_tiers = self.exchange.get_option("uses_leverage_tiers", True)
-            for pair in self.pairlists.whitelist:
+            # Iterate over effective_pairs for which we attempted to load data
+            for pair in effective_pairs:
+                if pair not in funding_rates_dict or pair not in mark_rates_dict:
+                    logger.debug(f"Funding or mark rate data missing for {pair}, cannot combine for futures_data.")
+                    continue # Skip if essential data for combining is missing
+
                 if uses_leverage_tiers and pair not in self.exchange._leverage_tiers:
                     unavailable_pairs.append(pair)
+                    logger.warning(f"Leverage tiers not available for {pair}, cannot backtest in futures mode.")
                     continue
 
                 self.futures_data[pair] = self.exchange.combine_funding_and_mark(
@@ -472,9 +733,11 @@ class Backtesting:
             )
 
             # Trim startup period from analyzed dataframe
-            df_analyzed = processed[pair] = pair_data = trim_dataframe(
+            df_trimmed_for_pair = trim_dataframe( # Use a new variable name for clarity
                 df_analyzed, self.timerange, startup_candles=self.required_startup
             )
+
+            df_analyzed = processed[pair] = pair_data = df_trimmed_for_pair # Assign back
 
             # Create a copy of the dataframe before shifting, that way the entry signal/tag
             # remains on the correct candle for callbacks.
@@ -906,21 +1169,32 @@ class Backtesting:
             trade = self._check_adjust_trade_for_candle(trade, row, current_time)
 
         if trade.is_open:
-            enter = row[SHORT_IDX] if trade.is_short else row[LONG_IDX]
-            exit_sig = row[ESHORT_IDX] if trade.is_short else row[ELONG_IDX]
-            exits = self.strategy.should_exit(
+            enter_signal_val = row[SHORT_IDX] if trade.is_short else row[LONG_IDX]
+            exit_signal_val = row[ESHORT_IDX] if trade.is_short else row[ELONG_IDX]
+            candle_time = row[DATE_IDX].to_pydatetime()
+            candle_open_price = row[OPEN_IDX]
+            candle_low_price = row[LOW_IDX]
+            candle_high_price = row[HIGH_IDX]
+
+            exits: list[ExitCheckTuple] = self.strategy.should_exit(
                 trade,  # type: ignore
-                row[OPEN_IDX],
-                row[DATE_IDX].to_pydatetime(),
-                enter=enter,
-                exit_=exit_sig,
-                low=row[LOW_IDX],
-                high=row[HIGH_IDX],
+                candle_open_price, # current_rate for should_exit
+                candle_time,    # current_time for should_exit
+                enter=enter_signal_val,
+                exit_=exit_signal_val,
+                low=candle_low_price,
+                high=candle_high_price,
             )
-            for exit_ in exits:
-                t = self._get_exit_for_signal(trade, row, exit_, current_time)
-                if t:
-                    return t
+
+            for exit_check_item in exits:
+                # current_time here is the main loop's current_time, which should be same as candle_time
+                processed_trade = self._get_exit_for_signal(trade, row, exit_check_item, current_time)
+                if processed_trade:
+                    # If _get_exit_for_signal returns a trade object, it means an exit order was created.
+                    # The actual processing of that order (filling it, closing the trade) happens later
+                    # in the main backtest_loop via _process_exit_order.
+                    # This return 't' (now 'processed_trade') is used by backtest_loop to know an exit was initiated.
+                    return processed_trade
         return None
 
     def _run_funding_fees(self, trade: LocalTrade, current_time: datetime, force: bool = False):
@@ -1228,8 +1502,12 @@ class Backtesting:
     def check_for_trade_entry(self, row) -> LongShort | None:
         enter_long = row[LONG_IDX] == 1
         exit_long = row[ELONG_IDX] == 1
-        enter_short = self._can_short and row[SHORT_IDX] == 1
-        exit_short = self._can_short and row[ESHORT_IDX] == 1
+        # Ensure SHORT_IDX is valid before accessing
+        enter_short_signal = row[SHORT_IDX] if len(row) > SHORT_IDX else 0
+        enter_short = self._can_short and enter_short_signal == 1
+        # Ensure ESHORT_IDX is valid
+        exit_short_signal = row[ESHORT_IDX] if len(row) > ESHORT_IDX else 0
+        exit_short = self._can_short and exit_short_signal == 1
 
         if enter_long == 1 and not any([exit_long, enter_short]):
             # Long
@@ -1283,10 +1561,6 @@ class Backtesting:
             oo = trade.select_order(side, True)
             if oo:
                 if (price == oo.price) and (side == oo.side) and (amount == oo.amount):
-                    # logger.info(
-                    #     f"A similar open order was found for {trade.pair}. "
-                    #     f"Keeping existing {trade.exit_side} order. {price=},  {amount=}"
-                    # )
                     return True
             self.cancel_open_orders(trade, current_time)
 
@@ -1427,6 +1701,7 @@ class Backtesting:
         current_time: datetime,
         trade_dir: LongShort | None,
         can_enter: bool,
+        is_active_for_new_entry: bool, # ADDED for dynamic pairlist entry gating
     ) -> LongShort | None:
         """
         NOTE: This method is used by Hyperopt at each iteration. Please keep it optimized.
@@ -1450,33 +1725,42 @@ class Backtesting:
         # max_open_trades must be respected
         # don't open on the last row
         # We only open trades on the main candle, not on detail candles
+        # Corrected if condition block with logging
+        log_can_enter_val = can_enter
+        log_trade_dir_not_none_val = trade_dir is not None
+        log_position_cond_val = (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
+        log_pair_locked_val = PairLocks.is_pair_locked(pair, row[DATE_IDX], trade_dir)
+        
         if (
-            can_enter
-            and trade_dir is not None
-            and (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
-            and not PairLocks.is_pair_locked(pair, row[DATE_IDX], trade_dir)
+            log_can_enter_val  # can_enter
+            and log_trade_dir_not_none_val  # trade_dir is not None
+            and is_active_for_new_entry  # Check if pair is in current dynamic whitelist
+            and log_position_cond_val  # (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
+            and not log_pair_locked_val  # not PairLocks.is_pair_locked(...)
         ):
             if self.trade_slot_available(LocalTrade.bt_open_open_trade_count):
                 trade = self._enter_trade(pair, row, trade_dir)
                 if trade:
                     self.wallets.update()
+                else:
+                    self._collate_rejected(pair, row)
             else:
                 self._collate_rejected(pair, row)
 
-        for trade in list(LocalTrade.bt_trades_open_pp[pair]):
+        for trade_to_check_exit in list(LocalTrade.bt_trades_open_pp[pair]):
             # 3. Process entry orders.
-            order = trade.select_order(trade.entry_side, is_open=True)
-            if self._try_close_open_order(order, trade, current_time, row):
+            order = trade_to_check_exit.select_order(trade_to_check_exit.entry_side, is_open=True)
+            if self._try_close_open_order(order, trade_to_check_exit, current_time, row): # Changed trade to trade_to_check_exit
                 self.wallets.update()
 
             # 4. Create exit orders (if any)
-            if trade.has_open_position:
-                self._check_trade_exit(trade, row, current_time)  # Place exit order if necessary
+            if trade_to_check_exit.has_open_position: # Changed trade to trade_to_check_exit
+                self._check_trade_exit(trade_to_check_exit, row, current_time)  # Changed trade to trade_to_check_exit
 
             # 5. Process exit orders.
-            order = trade.select_order(trade.exit_side, is_open=True)
+            order = trade_to_check_exit.select_order(trade_to_check_exit.exit_side, is_open=True) # Changed trade to trade_to_check_exit
             if order:
-                self._process_exit_order(order, trade, current_time, row, pair)
+                self._process_exit_order(order, trade_to_check_exit, current_time, row, pair) # Changed trade to trade_to_check_exit
 
         if exiting_dir and len(LocalTrade.bt_trades_open_pp[pair]) == 0:
             return exiting_dir
@@ -1538,7 +1822,7 @@ class Backtesting:
         self,
         start_date: datetime,
         end_date: datetime,
-        pairs: list[str],
+        pairs: list[str],  # Initial whitelist, potentially a superset from all timeline entries
         data: dict[str, list[tuple]],
     ):
         """
@@ -1552,94 +1836,173 @@ class Backtesting:
         )
         # Indexes per pair, so some pairs are allowed to have a missing start.
         indexes: dict = defaultdict(int)
+        # Keep track of the last used whitelist to avoid redundant lookups if timeline is sparse
+        last_active_whitelist: List[str] = []
 
         for current_time in self._time_generator(start_date, end_date):
             # Loop for each main candle.
             self.check_abort()
-            # Reset open trade count for this candle
-            # Critical to avoid exceeding max_open_trades in backtesting
-            # when timeframe-detail is used and trades close within the opening candle.
             strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
                 current_time=current_time
             )
             pair_detail_cache: dict[str, list[tuple]] = {}
             pair_tradedir_cache: dict[str, LongShort | None] = {}
-            pairs_with_open_trades = [t.pair for t in LocalTrade.bt_trades_open]
+            # Get pairs with open trades at the START of this main candle processing.
+            pairs_with_open_trades_at_main_candle_start = [t.pair for t in LocalTrade.bt_trades_open]
+
+            # Determine active whitelist for this current_time from pre-calculated timeline
+            active_whitelist_for_main_candle: List[str] = []
+            if self.pairlist_timeline:
+                relevant_timeline_keys = [
+                    ts for ts in self.pairlist_timeline if ts <= current_time
+                ]
+                if relevant_timeline_keys:
+                    latest_ts = max(relevant_timeline_keys)
+                    active_whitelist_for_main_candle = self.pairlist_timeline[latest_ts]
+                    last_active_whitelist = active_whitelist_for_main_candle
+                elif last_active_whitelist: # Fallback to last known if current_time is before any timeline entry
+                    active_whitelist_for_main_candle = last_active_whitelist
+                else: # Fallback if timeline is empty or current_time is before any entry
+                    active_whitelist_for_main_candle = pairs # Original static list from load_bt_data
+            else:
+                active_whitelist_for_main_candle = pairs # Use initial pairs if no timeline (e.g. StaticPairList)
+
+            # Pairs to process in the detail loop: active list + any pair that had an open trade at the start of this main candle
+            pairs_to_process_in_detail = list(dict.fromkeys(
+                active_whitelist_for_main_candle + pairs_with_open_trades_at_main_candle_start
+            ))
 
             for current_time_det, is_first, has_detail, idx, pair in self._time_pair_generator_det(
-                current_time, pairs
+                current_time, pairs_to_process_in_detail
             ):
-                # Loop for each detail candle (if necessary) and pair
-                # Yields only the main date if no detail timeframe is set.
-
-                # Pairs that have open trades should be processed first
+                is_in_active_whitelist = pair in active_whitelist_for_main_candle
+                is_in_open_trades_list = pair in pairs_with_open_trades_at_main_candle_start
+                
+                # Ensure the pair is either in the active whitelist for this main candle period
+                # OR it's a pair that had an open trade at the start of this main candle.
+                if not (is_in_active_whitelist or is_in_open_trades_list):
+                    continue
+                
                 trade_dir: LongShort | None = None
                 if is_first:
-                    # Main candle
-                    row_index = indexes[pair]
-                    row = self.validate_row(data, pair, row_index, current_time)
-                    if not row:
+                    # Main candle processing for this pair
+                    target_time = current_time # This is the global time step
+                    
+                    search_start_index = indexes[pair] # Start searching from last known good index for this pair
+                    row_index = -1 # Default to -1 if not found
+
+                    # Iterate forwards from search_start_index to find the row matching target_time
+                    if pair in data and len(data[pair]) > 0: # Ensure data exists for the pair
+                        for i in range(search_start_index, len(data[pair])):
+                            candidate_row_date = data[pair][i][DATE_IDX]
+
+                            if candidate_row_date == target_time:
+                                row_index = i
+                                break
+                            elif candidate_row_date > target_time:
+                                # We've passed the target_time for this pair's data. No exact match.
+                                # The pair might not have a candle at this exact global time.
+                                # Set row_index to -1 to indicate no suitable row found for this global time.
+                                row_index = -1
+                                break
+                        # If loop finishes without break and row_index is still -1 (or initial search_start_index was past end)
+                        # it means target_time was not found or is beyond the available data for this pair.
+                        if row_index != -1 and data[pair][row_index][DATE_IDX] != target_time: # Double check if found row is correct
+                             row_index = -1
+
+                    if row_index == -1: # No suitable row found for this pair at current global time
+                        # Original logic to advance index if skipped:
+                        if pair in data and len(data[pair]) > 0:
+                            next_search_idx = search_start_index
+                            for i in range(search_start_index, len(data[pair])):
+                                if data[pair][i][DATE_IDX] >= target_time: # Note: using target_time here
+                                    next_search_idx = i
+                                    break
+                            else:
+                                next_search_idx = len(data[pair])
+                            indexes[pair] = next_search_idx
                         continue
 
-                    row_index += 1
-                    indexes[pair] = row_index
-                    is_last_row = current_time == end_date
+                    # Now, row_index should point to the correct candle in data[pair] for current_time
+                    # The original validate_row is still useful for its IndexError check,
+                    # but the date check `row[DATE_IDX] > current_time` should ideally not be hit
+                    # if our search logic is correct and found an exact match.
+                    # If `row[DATE_IDX] < current_time` it means our search was flawed.
+                    row = self.validate_row(data, pair, row_index, current_time)
+
+                    if not row:
+                        # This case should be rare if row_index was found correctly,
+                        # unless validate_row has other reasons to fail (e.g. internal IndexError if data[pair] is empty, though checked above)
+                        indexes[pair] = row_index + 1 # Still advance index to avoid getting stuck
+                        continue
+                    
+                    # Critical check: Ensure the fetched row's date actually matches the global current_time
+                    if row[DATE_IDX] != current_time:
+                        indexes[pair] = row_index + 1 # Advance to avoid getting stuck on this mismatched row
+                        continue
+
+                    # Update indexes[pair] to point to the *next* candle for this pair, for the next global time step.
+                    indexes[pair] = row_index + 1
+                    
                     self.dataprovider._set_dataframe_max_index(
                         pair, self.required_startup + row_index
                     )
                     trade_dir = self.check_for_trade_entry(row)
                     pair_tradedir_cache[pair] = trade_dir
-
                 else:
                     # Detail candle - from cache.
-                    detail_data = pair_detail_cache.get(pair)
-                    if detail_data is None or len(detail_data) <= idx:
-                        # logger.info(f"skipping {pair}, {current_time_det}, {trade_dir}")
+                    detail_data_list = pair_detail_cache.get(pair)
+                    if detail_data_list is None or len(detail_data_list) <= idx:
                         continue
-                    row = detail_data[idx]
+                    row = detail_data_list[idx]
                     trade_dir = pair_tradedir_cache.get(pair)
 
                     if self.strategy.ignore_expired_candle(
-                        current_time - self.timeframe_td,  # last closed candle is 1 timeframe away.
+                        current_time - self.timeframe_td,
                         current_time_det,
                         self.timeframe_secs,
                         trade_dir is not None,
                     ):
-                        # Ignore late entries eventually
                         trade_dir = None
 
                 self.dataprovider._set_dataframe_max_date(current_time_det)
 
-                pair_has_open_trades = len(LocalTrade.bt_trades_open_pp[pair]) > 0
-                if pair in pairs_with_open_trades and not pair_has_open_trades:
-                    # Pair has had open trades which closed in the current main candle.
-                    # Skip this pair for this timeframe
-                    continue
-                if pair_has_open_trades and pair not in pairs_with_open_trades:
-                    # auto-lock for pairs that have open trades
-                    # Necessary for detail - to capture trades that open and close within
-                    # the same main candle
-                    pairs_with_open_trades.append(pair)
+                # Check current open trades for this pair to manage ongoing trades
+                current_open_trades_for_pair = LocalTrade.bt_trades_open_pp.get(pair, [])
+                pair_has_open_trades_now = len(current_open_trades_for_pair) > 0
+
+                if pair in pairs_with_open_trades_at_main_candle_start and not pair_has_open_trades_now:
+                    # This pair had a trade at the start of the main candle, but it closed during detail processing.
+                    # It should continue to be processed for this main candle's detail loop if it was in the active_whitelist.
+                    # If it wasn't in active_whitelist, it was only processed due to the open trade, so can stop if trade closed.
+                    if pair not in active_whitelist_for_main_candle:
+                        pass
+
 
                 if (
                     is_first
-                    and (trade_dir is not None or pair_has_open_trades)
+                    and (trade_dir is not None or pair_has_open_trades_now)
                     and has_detail
                     and pair not in pair_detail_cache
-                    and pair in self.detail_data
-                    and row
+                    and pair in self.detail_data # Ensure detail data exists for this pair
+                    and row # Ensure main row was valid
                 ):
-                    # Spread candle into detail timeframe and cache that -
-                    # only once per main candle
-                    # and only if we can expect activity.
                     pair_detail = self.get_detail_data(pair, row)
-                    if pair_detail is not None:
+                    if pair_detail is not None and len(pair_detail) > 0 :
                         pair_detail_cache[pair] = pair_detail
-                    row = pair_detail_cache[pair][idx]
+                        if idx < len(pair_detail): # Ensure idx is valid for the new detail data
+                           row = pair_detail[idx]
+                        else:
+                            continue # Should not happen if get_detail_data is correct
+                    else: # No detail data for this specific slice or empty
+                        if pair_has_open_trades_now: # If trade is open, we must use main candle row
+                            pass # Using main candle data
+                        else: # No trade open, no detail data, skip
+                           continue
+
 
                 is_last_row = current_time_det == end_date
-
-                yield current_time_det, pair, row, is_last_row, trade_dir
+                yield current_time_det, pair, row, is_last_row, trade_dir, is_in_active_whitelist
             self.progress.increment()
 
     def backtest(
@@ -1672,16 +2035,17 @@ class Backtesting:
             row,
             is_last_row,
             trade_dir,
+            is_active_for_new_entry, # Unpack the new flag
         ) in self.time_pair_generator(start_date, end_date, list(data.keys()), data):
             if not self._can_short or trade_dir is None:
                 # No need to reverse position if shorting is disabled or there's no new signal
-                self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row)
+                self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row, is_active_for_new_entry)
             else:
                 # Conditionally call backtest_loop a 2nd time if shorting is enabled,
                 # a position closed and a new signal in the other direction is available.
 
                 for _ in (0, 1):
-                    a = self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row)
+                    a = self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row, is_active_for_new_entry)
                     if not a or a == trade_dir:
                         # the trade didn't close or position change is in the same direction
                         break
@@ -1792,20 +2156,124 @@ class Backtesting:
         Run backtesting end-to-end
         """
         data: dict[str, DataFrame] = {}
+        # config_timerange will be determined by the final load_bt_data call.
+        # self.timerange is initialized in __init__ and holds the overall configured range.
+        # It's used by load_bt_data internally.
 
-        data, timerange = self.load_bt_data()
-        logger.info("Dataload complete. Calculating indicators")
+        # Step 1: Determine the true operational date range.
+        # This requires a preliminary data load using the initial whitelist to find data boundaries.
+        logger.info("Performing preliminary data load to determine actual date boundaries for pairlist timeline...")
+        
+        # Store original whitelist to ensure the preliminary load uses it, and it can be restored if needed.
+        # self.pairlists is initialized in __init__ and refresh_pairlist is called there.
+        initial_whitelist_for_daterange = self.pairlists.whitelist[:]
+        
+        # Use a temporary PairListManager if we need to absolutely ensure no side-effects
+        # on self.pairlists from this preliminary load, though load_bt_data uses the passed pairs.
+        # For this step, we primarily need load_bt_data to respect self.timerange and give us date boundaries.
+        # The pairs used for this initial load are just to get any data to establish the range.
+        
+        # Explicitly pass the initial_whitelist_for_daterange for the preliminary load.
+        # The returned timerange from this call is specific to this load.
+        temp_data_for_daterange, _ = self.load_bt_data(pairs_to_load=initial_whitelist_for_daterange)
 
+        if not temp_data_for_daterange:
+            # If initial whitelist is dynamic and empty, this might happen.
+            # Or if no data for any initial pairs in the configured range.
+            # Try to use self.timerange directly for timeline calculation if possible.
+            if not initial_whitelist_for_daterange and self.config.get('pairlists', [{}])[0].get('method') != 'StaticPairList':
+                 logger.warning("Initial whitelist was empty. Using configured timerange for pairlist timeline calculation.")
+                 min_date_for_timeline, max_date_for_timeline = self.timerange.startdt, self.timerange.stopdt
+                 if max_date_for_timeline == datetime(1970, 1, 1, 0, 0, tzinfo=timezone.utc) and self.timerange.stopts == 0: # Open-ended
+                     raise OperationalException(
+                         "Open-ended timerange with an empty initial whitelist is not supported "
+                         "for dynamic pairlist pre-calculation without a data-derived max_date."
+                     )
+            else:
+                raise OperationalException(
+                    "No data found for any pair in initial whitelist. "
+                    "Cannot determine date range for dynamic pairlist pre-calculation."
+                )
+        else:
+            min_date_for_timeline, max_date_for_timeline = history.get_timerange(temp_data_for_daterange)
+        
+        del temp_data_for_daterange # Free memory
+        logger.info(
+            f"Effective data range for pairlist pre-calculation: "
+            f"{min_date_for_timeline.strftime(DATETIME_PRINT_FORMAT)} to "
+            f"{max_date_for_timeline.strftime(DATETIME_PRINT_FORMAT)}"
+        )
+
+        # Step 2: Pre-calculate the pairlist timeline using these determined boundaries
+        self._precalculate_pairlist_timeline(min_date_for_timeline, max_date_for_timeline)
+
+        # Step 3: Construct the superset of all pairs from the timeline
+        super_set_of_all_pairs = set()
+        if self.pairlist_timeline:
+            for pairs_in_slot in self.pairlist_timeline.values():
+                super_set_of_all_pairs.update(pairs_in_slot)
+        
+        # Fallback if timeline is empty or yields no pairs (e.g., StaticPairList was used)
+        if not super_set_of_all_pairs:
+            logger.warning("Pairlist timeline did not yield any pairs. "
+                           "Using initial whitelist for the main data load.")
+            super_set_of_all_pairs.update(initial_whitelist_for_daterange)
+
+        if not super_set_of_all_pairs:
+            raise OperationalException(
+                "No pairs found to backtest after pairlist timeline generation and fallback."
+            )
+
+        logger.info(f"Superset of all pairs for main backtest data load: {len(super_set_of_all_pairs)}.")
+
+        # Step 4: Load all necessary data using the superset.
+        # The PairListManager's whitelist property has no setter.
+        # Instead, we pass the super_set_of_all_pairs directly to load_bt_data
+        # via the 'pairs_list' argument, which load_bt_data is modified to handle.
+        # self.pairlists.whitelist = list(super_set_of_all_pairs) # This line caused the AttributeError
+        
+        # The logger below would also fail if the above line was active and failed.
+        # It's kept for context but relies on load_bt_data using the superset correctly.
+        logger.info(f"Loading main backtest data for the superset of {len(super_set_of_all_pairs)} pairs...")
+        # This call to load_bt_data() is the definitive one for the backtest.
+        # It must use the super_set_of_all_pairs.
+        # The returned config_timerange will be based on the data actually loaded for the superset.
+        logger.info(f"Attempting main data load for super_set_of_all_pairs ({len(super_set_of_all_pairs)} pairs)...")
+        data, config_timerange = self.load_bt_data(pairs_to_load=list(super_set_of_all_pairs))
+        
+        if not data:
+            # This means no data could be loaded for ANY pair in the super_set_of_all_pairs.
+            raise OperationalException(
+                f"No data successfully loaded for any pair in the superset: {super_set_of_all_pairs}. "
+                "Check data availability for these pairs and timeframe within the configured range."
+            )
+
+        # These are now the definitive dates for the overall backtest based on the superset and timerange.
+        actual_min_date, actual_max_date = history.get_timerange(data)
+        logger.info(
+            f"Main dataload for superset complete. Final data range for backtest: "
+            f"{actual_min_date.strftime(DATETIME_PRINT_FORMAT)} to "
+            f"{actual_max_date.strftime(DATETIME_PRINT_FORMAT)}"
+        )
+        
         self.load_prior_backtest()
-
+        # config_timerange from the final load_bt_data is the one to use.
+ 
         for strat in self.strategylist:
             if self.results and strat.get_strategy_name() in self.results["strategy"]:
                 # When previous result hash matches - reuse that result and skip backtesting.
                 logger.info(f"Reusing result of previous backtest for {strat.get_strategy_name()}")
                 continue
-            min_date, max_date = self.backtest_one_strategy(strat, data, timerange)
+            # backtest_one_strategy uses its own min_date, max_date from processed data
+            # and the config_timerange for other purposes.
+            # actual_min_date and actual_max_date are now correctly set from the superset load.
+            # These will be used by generate_backtest_stats later.
+            self.backtest_one_strategy(strat, data, config_timerange)
 
         # Update old results with new ones.
+        # generate_backtest_stats needs the min_date, max_date from the superset data load.
+        if len(self.all_bt_content) > 0: # Check if any strategy was actually backtested
+            min_date, max_date = actual_min_date, actual_max_date # Use the definitive dates
         if len(self.all_bt_content) > 0:
             results = generate_backtest_stats(
                 data, self.all_bt_content, min_date=min_date, max_date=max_date

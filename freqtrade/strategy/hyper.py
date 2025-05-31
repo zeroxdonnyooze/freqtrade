@@ -110,16 +110,37 @@ class HyperStrategyMixin:
         * Parameters defined in parameters objects (buy_params, sell_params, ...)
         * Parameter defaults
         """
+        # Get the strategy-specific block directly using the strategy's name
+        # self is an instance of IStrategy (or a subclass) due to HyperStrategyMixin
+        strategy_name = self.get_strategy_name() # Assuming get_strategy_name() is available
+        strategy_params_from_config = self.config.get(strategy_name, {})
+        
 
-        buy_params = deep_merge_dicts(
-            self._ft_params_from_file.get("buy", {}), getattr(self, "buy_params", {})
-        )
-        sell_params = deep_merge_dicts(
-            self._ft_params_from_file.get("sell", {}), getattr(self, "sell_params", {})
-        )
-        protection_params = deep_merge_dicts(
-            self._ft_params_from_file.get("protection", {}), getattr(self, "protection_params", {})
-        )
+
+        # Parameters from strategy class attribute (e.g., self.buy_params = {...})
+        buy_params_from_strategy_attr = getattr(self, "buy_params", {})
+        # Parameters from <strategy>.json file
+        buy_params_from_file = self._ft_params_from_file.get("buy", {})
+        # Parameters from main config.json strategy_parameters.buy section
+        buy_params_from_main_config = strategy_params_from_config.get("buy", {})
+
+        # Merge: main_config overrides file, which overrides strategy attribute
+        buy_params = deep_merge_dicts(buy_params_from_strategy_attr, buy_params_from_file)
+        buy_params = deep_merge_dicts(buy_params, buy_params_from_main_config)
+
+
+        sell_params_from_strategy_attr = getattr(self, "sell_params", {})
+        sell_params_from_file = self._ft_params_from_file.get("sell", {})
+        sell_params_from_main_config = strategy_params_from_config.get("sell", {})
+        sell_params = deep_merge_dicts(sell_params_from_strategy_attr, sell_params_from_file)
+        sell_params = deep_merge_dicts(sell_params, sell_params_from_main_config)
+
+
+        protection_params_from_strategy_attr = getattr(self, "protection_params", {})
+        protection_params_from_file = self._ft_params_from_file.get("protection", {})
+        protection_params_from_main_config = strategy_params_from_config.get("protection", {})
+        protection_params = deep_merge_dicts(protection_params_from_strategy_attr, protection_params_from_file)
+        protection_params = deep_merge_dicts(protection_params, protection_params_from_main_config)
 
         self._ft_load_params(buy_params, "buy", hyperopt)
         self._ft_load_params(sell_params, "sell", hyperopt)
@@ -162,17 +183,38 @@ class HyperStrategyMixin:
 
             param_container.append(attr)
 
-            if params and attr_name in params:
-                if attr.load:
-                    attr.value = params[attr_name]
-                    logger.info(f"Strategy Parameter: {attr_name} = {attr.value}")
+            if attr.load:
+                loaded_value = None
+                source_description = "default" # Default source description
+
+                # 1. Check in space-specific params dictionary (e.g., buy_params derived from config's strategy_parameters.buy)
+                if params and attr_name in params:
+                    loaded_value = params[attr_name]
+                    source_description = f"space-specific params dict for space '{space}'"
                 else:
-                    logger.warning(
-                        f'Parameter "{attr_name}" exists, but is disabled. '
-                        f'Default value "{attr.value}" used.'
-                    )
-            else:
-                logger.info(f"Strategy Parameter(default): {attr_name} = {attr.value}")
+                    # 2. If not in space-specific, check the strategy-specific block from the main config.
+                    # This was already loaded into strategy_params_from_config in ft_load_hyper_params
+                    # and then into `params` for the current space.
+                    # The original `params` dictionary (e.g., buy_params) should contain the correct values if the
+                    # strategy_params_from_config was loaded correctly.
+                    # This fallback might be redundant if the initial `params` construction is correct.
+                    # However, to be safe and align with the original intent of checking a broader scope:
+                    strategy_block_from_config = self.config.get(self.get_strategy_name(), {})
+                    if attr_name in strategy_block_from_config:
+                        if not isinstance(strategy_block_from_config[attr_name], dict): # Ensure it's a simple value
+                            loaded_value = strategy_block_from_config[attr_name]
+                            source_description = f"config's strategy block '{self.get_strategy_name()}' (param for space '{space}')"
+                
+                if loaded_value is not None:
+                    attr.value = loaded_value
+                    logger.info(f"Strategy Parameter ({source_description}): {attr_name} = {attr.value}")
+                else: # Not found in specific or suitable top-level, use default
+                    logger.info(f"Strategy Parameter(default): {attr_name} = {attr.value}")
+            else: # attr.load is False
+                logger.warning(
+                    f'Parameter "{attr_name}" exists, but is disabled (load=False). '
+                    f'Default value "{attr.value}" used.'
+                )
 
     def get_no_optimize_params(self) -> dict[str, dict]:
         """

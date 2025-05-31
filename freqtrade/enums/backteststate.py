@@ -10,7 +10,8 @@ class BacktestState(Enum):
     DATALOAD = 2
     ANALYZE = 3
     CONVERT = 4
-    BACKTEST = 5
+    PAIRLIST_PRECALC = 5
+    BACKTEST = 6
 
     def __str__(self):
         return f"{self.name.lower()}"
